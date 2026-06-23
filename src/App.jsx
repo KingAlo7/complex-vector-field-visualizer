@@ -192,6 +192,8 @@ const findRoots = (uFunc, x, targetU, yMin = -10, yMax = 10, steps = 100) => {
 
 export default function App() {
   const canvasRef = useRef(null);
+  const reCanvasRef = useRef(null);
+  const imCanvasRef = useRef(null);
   const [viewMode, setViewMode] = useState("mixed");
   const [selectedFn, setSelectedFn] = useState("z2");
   const [gridDensity, setGridDensity] = useState(25);
@@ -347,13 +349,110 @@ export default function App() {
     }
   }, [activeFunction, gridDensity, vectorScale, showVoids, viewMode, isAnimating]);
 
+  // Draws a scalar heatmap of either Re(f(z)) or Im(f(z)) over the (x, y) plane.
+  // This is independent of viewMode / branch selection: it always evaluates the
+  // standard f(z) = u + iv at each (x, y) and colors the cell by the chosen part.
+  const drawComponentField = useCallback((canvas, part) => {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    const bounds = { xMin: -5, xMax: 5, yMin: -5, yMax: 5 };
+
+    ctx.clearRect(0, 0, width, height);
+
+    const fn = activeFunction;
+    const samples = Math.max(40, gridDensity * 2); // finer than the arrow grid for a smooth-looking heatmap
+    const cellW = width / samples;
+    const cellH = height / samples;
+    const dxField = (bounds.xMax - bounds.xMin) / samples;
+    const dyField = (bounds.yMax - bounds.yMin) / samples;
+
+    // First pass: compute all values so we can normalize color intensity sensibly.
+    const values = new Float64Array(samples * samples);
+    let maxAbs = 1e-6;
+    for (let j = 0; j < samples; j++) {
+      const y = bounds.yMax - (j + 0.5) * dyField; // top row = max y
+      for (let i = 0; i < samples; i++) {
+        const x = bounds.xMin + (i + 0.5) * dxField;
+        const std = fn.getStandard(x, y);
+        const val = part === 're' ? std.u : std.v;
+        const v = Number.isFinite(val) ? val : 0;
+        values[j * samples + i] = v;
+        const av = Math.abs(v);
+        if (av > maxAbs && Number.isFinite(av)) maxAbs = av;
+      }
+    }
+    // Clamp normalization so a few outliers don't wash out the whole map
+    const norm = Math.min(maxAbs, 25);
+
+    for (let j = 0; j < samples; j++) {
+      for (let i = 0; i < samples; i++) {
+        const v = values[j * samples + i];
+        const t = Math.max(-1, Math.min(1, v / norm)); // -1..1
+
+        // Diverging colormap: negative -> blue, zero -> near-black, positive -> red/orange
+        let r, g, b;
+        if (t >= 0) {
+          r = Math.round(15 + t * 225);
+          g = Math.round(23 + t * 70);
+          b = Math.round(42 - t * 30);
+        } else {
+          const s = -t;
+          r = Math.round(15 - s * 9);
+          g = Math.round(23 + s * 95);
+          b = Math.round(42 + s * 170);
+        }
+        ctx.fillStyle = `rgb(${r}, ${g}, ${b})`;
+        ctx.fillRect(i * cellW, j * cellH, cellW + 1, cellH + 1);
+      }
+    }
+
+    // Axes
+    const mapX = (x) => ((x - bounds.xMin) / (bounds.xMax - bounds.xMin)) * width;
+    const mapY = (y) => height - ((y - bounds.yMin) / (bounds.yMax - bounds.yMin)) * height;
+    ctx.strokeStyle = "rgba(148, 163, 184, 0.4)";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(mapX(0), 0);
+    ctx.lineTo(mapX(0), height);
+    ctx.moveTo(0, mapY(0));
+    ctx.lineTo(width, mapY(0));
+    ctx.stroke();
+
+    // Zero contour: draw where sign flips between neighboring samples (cheap marching-squares-lite)
+    ctx.fillStyle = "#0f172a";
+    for (let j = 0; j < samples - 1; j++) {
+      for (let i = 0; i < samples - 1; i++) {
+        const v00 = values[j * samples + i];
+        const v10 = values[j * samples + (i + 1)];
+        const v01 = values[(j + 1) * samples + i];
+        const signSet = new Set([Math.sign(v00), Math.sign(v10), Math.sign(v01)]);
+        if (signSet.has(1) && signSet.has(-1)) {
+          ctx.fillRect(i * cellW + cellW / 2 - 0.5, j * cellH + cellH / 2 - 0.5, 1, 1);
+        }
+      }
+    }
+
+    // Label
+    ctx.fillStyle = "#e2e8f0";
+    ctx.font = "bold 13px monospace";
+    ctx.fillText(part === 're' ? "Re(f(z)) = u(x,y)" : "Im(f(z)) = v(x,y)", 8, 18);
+  }, [activeFunction, gridDensity]);
+
   useEffect(() => {
     drawField();
-    
-    const handleResize = () => drawField();
+    drawComponentField(reCanvasRef.current, 're');
+    drawComponentField(imCanvasRef.current, 'im');
+
+    const handleResize = () => {
+      drawField();
+      drawComponentField(reCanvasRef.current, 're');
+      drawComponentField(imCanvasRef.current, 'im');
+    };
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-  }, [drawField]);
+  }, [drawField, drawComponentField]);
 
   useEffect(() => {
     if (!isAnimating) return;
@@ -565,13 +664,34 @@ export default function App() {
         )}
       </div>
 
-      <div className="flex-1 relative bg-slate-950 overflow-hidden w-full h-full p-4 flex justify-center items-center">
-        <canvas 
-          ref={canvasRef} 
-          width={800} 
-          height={800}
-          className="bg-slate-900 border border-slate-700 shadow-2xl max-w-full max-h-full object-contain rounded"
-        />
+      <div className="flex-1 relative bg-slate-950 overflow-hidden w-full h-full p-4 flex flex-col lg:flex-row gap-4 justify-center items-center">
+        <div className="flex flex-col items-center gap-2 flex-1 min-w-0 h-full">
+          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Combined Field</span>
+          <canvas
+            ref={canvasRef}
+            width={800}
+            height={800}
+            className="bg-slate-900 border border-slate-700 shadow-2xl max-w-full max-h-full object-contain rounded"
+          />
+        </div>
+        <div className="flex flex-col items-center gap-2 flex-1 min-w-0 h-full">
+          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Real Part Only</span>
+          <canvas
+            ref={reCanvasRef}
+            width={500}
+            height={500}
+            className="bg-slate-900 border border-slate-700 shadow-2xl max-w-full max-h-full object-contain rounded"
+          />
+        </div>
+        <div className="flex flex-col items-center gap-2 flex-1 min-w-0 h-full">
+          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Imaginary Part Only</span>
+          <canvas
+            ref={imCanvasRef}
+            width={500}
+            height={500}
+            className="bg-slate-900 border border-slate-700 shadow-2xl max-w-full max-h-full object-contain rounded"
+          />
+        </div>
       </div>
     </div>
   );
