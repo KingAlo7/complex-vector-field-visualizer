@@ -201,6 +201,7 @@ export default function App() {
   const [showVoids, setShowVoids] = useState(true);
   const [isAnimating, setIsAnimating] = useState(false);
   const [customFStr, setCustomFStr] = useState("z^2 + i*z");
+  const [componentMode, setComponentMode] = useState("heatmap"); // "heatmap" | "realLine"
   
   const particlesRef = useRef([]);
 
@@ -440,19 +441,123 @@ export default function App() {
     ctx.fillText(part === 're' ? "Re(f(z)) = u(x,y)" : "Im(f(z)) = v(x,y)", 8, 18);
   }, [activeFunction, gridDensity]);
 
+  // Draws a standard R -> R line graph: restricts z to the real axis (z = x + 0i)
+  // and plots either Re(f(x)) or Im(f(x)) against x, exactly like a normal function plot.
+  const drawRealLineGraph = useCallback((canvas, part) => {
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const width = canvas.width;
+    const height = canvas.height;
+    const bounds = { xMin: -5, xMax: 5 };
+
+    ctx.clearRect(0, 0, width, height);
+    ctx.fillStyle = "#0f172a";
+    ctx.fillRect(0, 0, width, height);
+
+    const fn = activeFunction;
+    const samples = Math.max(200, gridDensity * 10); // smooth curve, independent of arrow grid density
+    const dxField = (bounds.xMax - bounds.xMin) / samples;
+
+    const xs = new Float64Array(samples + 1);
+    const ys = new Float64Array(samples + 1);
+    let maxAbs = 1e-6;
+    for (let i = 0; i <= samples; i++) {
+      const x = bounds.xMin + i * dxField;
+      const std = fn.getStandard(x, 0); // z = x + 0i, purely real input
+      const val = part === 're' ? std.u : std.v;
+      const v = Number.isFinite(val) ? val : NaN;
+      xs[i] = x;
+      ys[i] = v;
+      if (Number.isFinite(v)) maxAbs = Math.max(maxAbs, Math.abs(v));
+    }
+    // Clamp the y-range so a single blow-up point doesn't flatten the whole curve
+    const yRange = Math.min(maxAbs * 1.15, 50);
+    const yBounds = { yMin: -yRange, yMax: yRange };
+
+    const mapX = (x) => ((x - bounds.xMin) / (bounds.xMax - bounds.xMin)) * width;
+    const mapY = (y) => height - ((y - yBounds.yMin) / (yBounds.yMax - yBounds.yMin)) * height;
+
+    // Gridlines
+    ctx.strokeStyle = "#1e293b";
+    ctx.lineWidth = 1;
+    for (let gx = Math.ceil(bounds.xMin); gx <= bounds.xMax; gx++) {
+      ctx.beginPath();
+      ctx.moveTo(mapX(gx), 0);
+      ctx.lineTo(mapX(gx), height);
+      ctx.stroke();
+    }
+    const yStep = yRange > 10 ? Math.ceil(yRange / 5) : 1;
+    for (let gy = Math.ceil(yBounds.yMin / yStep) * yStep; gy <= yBounds.yMax; gy += yStep) {
+      ctx.beginPath();
+      ctx.moveTo(0, mapY(gy));
+      ctx.lineTo(width, mapY(gy));
+      ctx.stroke();
+    }
+
+    // Axes (x-axis at y=0, y-axis at x=0)
+    ctx.strokeStyle = "#475569";
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(0, mapY(0));
+    ctx.lineTo(width, mapY(0));
+    ctx.moveTo(mapX(0), 0);
+    ctx.lineTo(mapX(0), height);
+    ctx.stroke();
+
+    // The curve itself — break the path wherever the value is non-finite (asymptotes)
+    ctx.strokeStyle = part === 're' ? "#06b6d4" : "#ec4899";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i <= samples; i++) {
+      const y = ys[i];
+      if (!Number.isFinite(y) || Math.abs(y) > yBounds.yMax * 1.5) {
+        started = false;
+        continue;
+      }
+      const px = mapX(xs[i]);
+      const py = mapY(y);
+      if (!started) {
+        ctx.moveTo(px, py);
+        started = true;
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+    ctx.stroke();
+
+    // Axis tick labels
+    ctx.fillStyle = "#94a3b8";
+    ctx.font = "11px monospace";
+    for (let gx = Math.ceil(bounds.xMin); gx <= bounds.xMax; gx++) {
+      if (gx === 0) continue;
+      ctx.fillText(String(gx), mapX(gx) + 2, mapY(0) - 4);
+    }
+    ctx.fillText("0", mapX(0) + 4, mapY(0) + 12);
+
+    // Title
+    ctx.fillStyle = "#e2e8f0";
+    ctx.font = "bold 13px monospace";
+    ctx.fillText(
+      part === 're' ? "Re(f(x)),  z = x + 0i" : "Im(f(x)),  z = x + 0i",
+      8, 18
+    );
+  }, [activeFunction, gridDensity]);
+
   useEffect(() => {
     drawField();
-    drawComponentField(reCanvasRef.current, 're');
-    drawComponentField(imCanvasRef.current, 'im');
+    const drawSide = componentMode === 'heatmap' ? drawComponentField : drawRealLineGraph;
+    drawSide(reCanvasRef.current, 're');
+    drawSide(imCanvasRef.current, 'im');
 
     const handleResize = () => {
       drawField();
-      drawComponentField(reCanvasRef.current, 're');
-      drawComponentField(imCanvasRef.current, 'im');
+      drawSide(reCanvasRef.current, 're');
+      drawSide(imCanvasRef.current, 'im');
     };
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
-  }, [drawField, drawComponentField]);
+  }, [drawField, drawComponentField, drawRealLineGraph, componentMode]);
 
   useEffect(() => {
     if (!isAnimating) return;
@@ -637,6 +742,39 @@ export default function App() {
             )}
           </div>
         </div>
+
+        <div className="mt-4 flex items-center gap-3">
+          <span className="text-sm font-medium text-slate-300">Side Panels:</span>
+          <div className="inline-flex rounded-lg border border-slate-600 overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setComponentMode('heatmap')}
+              className={`px-3 py-1.5 text-sm font-medium transition-colors ${
+                componentMode === 'heatmap'
+                  ? 'bg-cyan-500 text-slate-900'
+                  : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+              }`}
+            >
+              2D Heatmap (x,y)
+            </button>
+            <button
+              type="button"
+              onClick={() => setComponentMode('realLine')}
+              className={`px-3 py-1.5 text-sm font-medium transition-colors border-l border-slate-600 ${
+                componentMode === 'realLine'
+                  ? 'bg-cyan-500 text-slate-900'
+                  : 'bg-slate-700 text-slate-300 hover:bg-slate-600'
+              }`}
+            >
+              Real-Axis Plot f(x)
+            </button>
+          </div>
+          <span className="text-xs text-slate-500">
+            {componentMode === 'heatmap'
+              ? 'Shows Re(f) and Im(f) as color fields over the full complex plane.'
+              : 'Restricts z to the real axis (z = x + 0i) and plots Re(f(x)), Im(f(x)) as ordinary R → R graphs.'}
+          </span>
+        </div>
         
         {selectedFn === 'custom' && (
           <div className="mt-4 bg-slate-800 p-4 rounded border border-slate-700">
@@ -675,7 +813,9 @@ export default function App() {
           />
         </div>
         <div className="flex flex-col items-center gap-2 flex-1 min-w-0 h-full">
-          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Real Part Only</span>
+          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+            Real Part Only {componentMode === 'realLine' ? '— f(x), x real' : ''}
+          </span>
           <canvas
             ref={reCanvasRef}
             width={500}
@@ -684,7 +824,9 @@ export default function App() {
           />
         </div>
         <div className="flex flex-col items-center gap-2 flex-1 min-w-0 h-full">
-          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Imaginary Part Only</span>
+          <span className="text-xs font-semibold text-slate-400 uppercase tracking-wide">
+            Imaginary Part Only {componentMode === 'realLine' ? '— f(x), x real' : ''}
+          </span>
           <canvas
             ref={imCanvasRef}
             width={500}
